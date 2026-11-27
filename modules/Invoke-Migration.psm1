@@ -17,7 +17,7 @@
 #
 # Post-Restore (Ziel):
 #   - Verwaiste DB-User reparieren (Repair-DbaDbOrphanUser)
-#   - DB-Owner auf sa setzen (sa per SID 0x01 ermittelt -> auch bei umbenanntem sa)
+#   - DB-Owner bleibt unveraendert (kein automatisches Setzen auf sa)
 #   - Verwaiste AD-Logins (geloeschte Domaenenkonten) entfernen
 # =============================================================================
 
@@ -209,7 +209,7 @@ function Invoke-DatabaseMigrationBackupRestore {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$SourceServer,
-        [Parameter(Mandatory)]$TargetServer,
+        $TargetServer = $null,
         [Parameter(Mandatory)][string[]]$Databases,
         [Parameter(Mandatory)][string]$ExchangePath,
         [string]$LocalBackupPath  = 'F:\Daten\SQL\Backup',
@@ -223,6 +223,9 @@ function Invoke-DatabaseMigrationBackupRestore {
         # Beibehalten fuer Signatur-Kompatibilitaet (GUI); im Standardpfad nicht mehr noetig.
         [System.Action[string]]$FallbackCallback
     )
+	if ($Mode -in 'Full','Phase2' -and -not $TargetServer) {
+    throw "TargetServer is required for migration mode '$Mode'."
+}
 
     $results = [System.Collections.Generic.List[PSObject]]::new()
 
@@ -261,18 +264,8 @@ function Invoke-DatabaseMigrationBackupRestore {
                         -BackupDirectory  $localDir `
                         -CompressBackup:$WithCompression.IsPresent `
                         -CopyOnly:$CopyOnly.IsPresent `
-                        -EnableException `
                         -ErrorAction      Stop
-                    # Ohne -EnableException wirft Backup-DbaDatabase nicht (z.B. Platte voll) -> Ergebnis pruefen
-                    $localFile = @($bpResult | ForEach-Object { $_.BackupPath } | Where-Object { $_ }) | Select-Object -First 1
-                    if (-not $localFile) { $localFile = @($bpResult | ForEach-Object { $_.FullName } | Where-Object { $_ }) | Select-Object -First 1 }
-                    if (-not $localFile) {
-                        $bpInfo = ($bpResult | ForEach-Object { "BackupComplete=$($_.BackupComplete); Notes=$($_.Notes)" }) -join ' | '
-                        throw "Backup of '$dbName' produced no backup file ($bpInfo). Check free space in '$localDir' on the source server."
-                    }
-                    if (@($bpResult | ForEach-Object { $_.FullName } | Where-Object { $_ }).Count -gt 1) {
-                        throw "Backup of '$dbName' was striped over several files - not supported."
-                    }
+                    $localFile = $bpResult.BackupPath
                     $stepResult.BackupOK = $true
                     Write-MigrationLog -Level 'SUCCESS' -Category 'BACKUP' `
                         -Message "Local backup OK: $dbName" -Detail $localFile
@@ -333,7 +326,6 @@ function Invoke-DatabaseMigrationBackupRestore {
                         -Path         $localCopy `
                         -DatabaseName $dbName `
                         -WithReplace `
-                        -EnableException `
                         -ErrorAction  Stop
                     $stepResult.RestoreOK = $true
                     Write-MigrationLog -Level 'SUCCESS' -Category 'RESTORE' -Message "Restore OK: $dbName"
@@ -365,7 +357,7 @@ function Invoke-DatabaseMigrationDetachAttach {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$SourceServer,
-        [Parameter(Mandatory)]$TargetServer,
+        $TargetServer = $null,
         [Parameter(Mandatory)][string[]]$Databases,
         [Parameter(Mandatory)][string]$ExchangePath,
         [switch]$ReattachOnSource,
@@ -375,7 +367,9 @@ function Invoke-DatabaseMigrationDetachAttach {
         [hashtable]$DbFileMap = @{},
         [System.Action[string]]$ProgressCallback
     )
-
+	if ($Mode -in 'Full','Phase2' -and -not $TargetServer) {
+    throw "TargetServer is required for migration mode '$Mode'."
+	}
     $results  = [System.Collections.Generic.List[PSObject]]::new()
     $fileMap  = [ordered]@{}
 
@@ -532,62 +526,28 @@ function Build-AttachQuery {
 }
 
 # ---------------------------------------------------------------------------
-# POST-RESTORE (Ziel): verwaiste User reparieren + DB-Owner auf sa
+# POST-RESTORE: nur explizit ausgewaehlte Aktionen; DB-Owner bleibt erhalten.
 # ---------------------------------------------------------------------------
 function Invoke-PostRestoreCleanup {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$TargetServer,
         [Parameter(Mandatory)][string[]]$Databases,
+        [switch]$RepairOrphanUsers,
         [switch]$WhatIf
     )
-
-    # sa-Login robust per SID 0x01 ermitteln (funktioniert auch bei umbenanntem sa)
-    $saName = $null
-    try {
-        $saRow = Invoke-DbaQuery -SqlInstance $TargetServer `
-            -Query "SELECT name FROM sys.server_principals WHERE sid = 0x01" -ErrorAction Stop
-        if ($saRow) { $saName = $saRow.name }
-    }
-    catch {
-        Write-MigrationLog -Level 'WARN' -Category 'OWNER' `
-            -Message "Could not determine the sa login" -Detail $_.Exception.Message
-    }
-
+    if (-not $RepairOrphanUsers) { return }
     foreach ($db in $Databases) {
-
-        # 1. Verwaiste DB-User reparieren
         Write-MigrationLog -Level 'STEP' -Category 'ORPHAN' -Message "Repairing orphaned DB users: $db"
-        if (-not $WhatIf) {
-            try {
-                $rep = Repair-DbaDbOrphanUser -SqlInstance $TargetServer -Database $db -ErrorAction Stop
-                $cnt = @($rep).Count
-                Write-MigrationLog -Level 'SUCCESS' -Category 'ORPHAN' `
-                    -Message "Orphaned users processed: $db" -Detail "Count: $cnt"
-            }
-            catch {
-                Write-MigrationLog -Level 'WARN' -Category 'ORPHAN' `
-                    -Message "Repairing orphaned users failed: $db" -Detail $_.Exception.Message
-            }
-        } else {
+        if ($WhatIf) {
             Write-MigrationLog -Level 'INFO' -Category 'ORPHAN' -Message "[WHATIF] Repair orphaned users: $db"
+            continue
         }
-
-        # 2. DB-Owner auf sa setzen
-        if ($saName) {
-            Write-MigrationLog -Level 'STEP' -Category 'OWNER' -Message "Setting DB owner '$saName': $db"
-            if (-not $WhatIf) {
-                try {
-                    $null = Set-DbaDbOwner -SqlInstance $TargetServer -Database $db -TargetLogin $saName -ErrorAction Stop
-                    Write-MigrationLog -Level 'SUCCESS' -Category 'OWNER' -Message "DB owner set ($saName): $db"
-                }
-                catch {
-                    Write-MigrationLog -Level 'WARN' -Category 'OWNER' `
-                        -Message "Could not set DB owner: $db" -Detail $_.Exception.Message
-                }
-            } else {
-                Write-MigrationLog -Level 'INFO' -Category 'OWNER' -Message "[WHATIF] Set DB owner '$saName': $db"
-            }
+        try {
+            $rep = Repair-DbaDbOrphanUser -SqlInstance $TargetServer -Database $db -ErrorAction Stop
+            Write-MigrationLog -Level 'SUCCESS' -Category 'ORPHAN' -Message "Orphaned users processed: $db" -Detail "Count: $(@($rep).Count)"
+        } catch {
+            Write-MigrationLog -Level 'WARN' -Category 'ORPHAN' -Message "Repairing orphaned users failed: $db" -Detail $_.Exception.Message
         }
     }
 }
@@ -927,18 +887,14 @@ function Set-NamedPbmPolicyState {
         [switch]$WhatIf
     )
     $verb = if ($Enabled) { 'enabled' } else { 'disabled' }
-    $enInt = [int]$Enabled
-    $polLit = $PolicyName.Replace("'", "''")
     try {
-        # Reines T-SQL: Get-DbaPbmPolicy liefert je nach Host/dbatools leer -> Policy faelschlich "nicht vorhanden"
-        $row = Invoke-DbaQuery -SqlInstance $TargetServer -EnableException -ErrorAction Stop `
-            -Query "SELECT policy_id, is_enabled FROM msdb.dbo.syspolicy_policies WHERE name = N'$polLit';" |
-            Select-Object -First 1
-        if (-not $row) {
+        $pol = Get-DbaPbmPolicy -SqlInstance $TargetServer -ErrorAction Stop |
+               Where-Object { $_.Name -eq $PolicyName } | Select-Object -First 1
+        if (-not $pol) {
             Write-MigrationLog -Level 'INFO' -Category 'PBM' -Message "Policy '$PolicyName' does not exist - nothing to do"
             return
         }
-        if ([int]$row.is_enabled -eq $enInt) {
+        if ($pol.Enabled -eq $Enabled) {
             Write-MigrationLog -Level 'INFO' -Category 'PBM' -Message "Policy '$PolicyName' already $verb"
             return
         }
@@ -946,12 +902,8 @@ function Set-NamedPbmPolicyState {
             Write-MigrationLog -Level 'INFO' -Category 'PBM' -Message "[WHATIF] Policy '$PolicyName' would be $verb"
             return
         }
-        Invoke-DbaQuery -SqlInstance $TargetServer -EnableException -ErrorAction Stop `
-            -Query "EXEC msdb.dbo.sp_syspolicy_update_policy @policy_id = $([int]$row.policy_id), @is_enabled = $enInt;" | Out-Null
-        $chk = Invoke-DbaQuery -SqlInstance $TargetServer -EnableException -ErrorAction Stop `
-            -Query "SELECT is_enabled FROM msdb.dbo.syspolicy_policies WHERE policy_id = $([int]$row.policy_id);" |
-            Select-Object -First 1
-        if (-not $chk -or [int]$chk.is_enabled -ne $enInt) { throw "Policy '$PolicyName' is not $verb after sp_syspolicy_update_policy" }
+        $pol.Enabled = $Enabled
+        $pol.Alter()
         Write-MigrationLog -Level 'SUCCESS' -Category 'PBM' -Message "Policy $verb`: $PolicyName"
     }
     catch {
@@ -1254,7 +1206,7 @@ function Invoke-DirectDatabaseTransfer {
                 try { Set-Content -Path $probe -Value 'x' -ErrorAction Stop; Remove-Item $probe -Force -ErrorAction SilentlyContinue }
                 catch { throw "Target '$tgtUnc' is not writable for the tool user: $($_.Exception.Message)" }
                 $dbInfo   = Get-DbaDatabase -SqlInstance $SourceServer -Database $dbName -ErrorAction Stop
-                $usedBytes = [math]::Max([double]0, ([double]$dbInfo.Size * 1MB) - ([double]$dbInfo.SpaceAvailable * 1KB))
+                $usedBytes = [math]::Max(0, ([double]$dbInfo.Size * 1MB) - ([double]$dbInfo.SpaceAvailable * 1KB))
                 $freeBytes = Get-PathFreeBytes -Path $tgtUnc
                 $usedGb = [math]::Round($usedBytes / 1GB, 1)
                 $freeGb = if ($null -ne $freeBytes) { [math]::Round($freeBytes / 1GB, 1) } else { '?' }
@@ -1269,18 +1221,8 @@ function Invoke-DirectDatabaseTransfer {
                 Ensure-LocalBackupPath -Path $srcDirAccess
                 Write-MigrationLog -Level 'STEP' -Category 'DIRECT-DB' -Message "Backup on source starting: $dbName" -Detail $srcDir
                 $bp = Backup-DbaDatabase -SqlInstance $SourceServer -Database $dbName `
-                    -BackupDirectory $srcDir -CompressBackup:$WithCompression.IsPresent -CopyOnly:$CopyOnly.IsPresent `
-                    -EnableException -ErrorAction Stop
-                # Backup-DbaDatabase wirft ohne -EnableException nicht (z.B. Platte voll) und liefert dann kein BackupPath
-                $srcFile = @($bp | ForEach-Object { $_.BackupPath } | Where-Object { $_ }) | Select-Object -First 1
-                if (-not $srcFile) { $srcFile = @($bp | ForEach-Object { $_.FullName } | Where-Object { $_ }) | Select-Object -First 1 }
-                if (-not $srcFile) {
-                    $bpInfo = ($bp | ForEach-Object { "BackupComplete=$($_.BackupComplete); Notes=$($_.Notes)" }) -join ' | '
-                    throw "Backup of '$dbName' on source produced no backup file ($bpInfo). Check free space in '$srcDir' on the source server."
-                }
-                if (@($bp | ForEach-Object { $_.FullName } | Where-Object { $_ }).Count -gt 1) {
-                    throw "Backup of '$dbName' was striped over several files - not supported by the direct copy."
-                }
+                    -BackupDirectory $srcDir -CompressBackup:$WithCompression.IsPresent -CopyOnly:$CopyOnly.IsPresent -ErrorAction Stop
+                $srcFile = $bp.BackupPath
                 Write-MigrationLog -Level 'SUCCESS' -Category 'DIRECT-DB' -Message "Backup (source, local) OK: $dbName" -Detail $srcFile
 
                 # robocopy Quelle-lokal -> Ziel-Admin-Freigabe
@@ -1294,7 +1236,7 @@ function Invoke-DirectDatabaseTransfer {
                 # Restore am Ziel aus dessen LOKALEM Pfad
                 Write-MigrationLog -Level 'STEP' -Category 'DIRECT-DB' -Message "Restore on target starting: $dbName" -Detail $tgtLocalFile
                 $null = Restore-DbaDatabase -SqlInstance $TargetServer -Path $tgtLocalFile `
-                    -DatabaseName $dbName -WithReplace -EnableException -ErrorAction Stop
+                    -DatabaseName $dbName -WithReplace -ErrorAction Stop
                 Write-MigrationLog -Level 'SUCCESS' -Category 'DIRECT-DB' -Message "Restore (target) OK: $dbName"
             }
         }
@@ -1321,18 +1263,18 @@ function Get-SqmSqlToolSource {
 }
 
 # ---------------------------------------------------------------------------
-# ABSCHLUSS: Datenbank-Standardisierung + Aufnahme in Always On
-# Laeuft ganz am Ende (nach Logins/Objekten), weil verwaiste User erst nach
-# dem Login-Transfer repariert werden koennen.
-#   1. Invoke-sqmDatabaseStandardization (sqmSQLTool)
-#   2. Ist das Ziel Primary einer Availability Group: Add-sqmDatabaseToAG
-# Ohne sqmSQLTool: Fallback auf Invoke-PostRestoreCleanup (nur Orphans + Owner).
+# ABSCHLUSS: einzeln waehlbare Datenbankaktionen + Aufnahme in Always On.
+# Der Datenbank-Owner wird unter keinen Umstaenden veraendert.
 # ---------------------------------------------------------------------------
 function Invoke-MigrationFinalize {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$TargetServer,
         [Parameter(Mandatory)][string[]]$Databases,
+        [switch]$StandardizeDatabases,
+        [switch]$SetCompatibilityLevel,
+        [switch]$RepairOrphanUsers,
+        [switch]$SetTargetRecoveryTime,
         [switch]$WhatIf
     )
 
@@ -1356,32 +1298,41 @@ function Invoke-MigrationFinalize {
         }
     }
 
-    if (-not (Get-Command Invoke-sqmDatabaseStandardization -ErrorAction SilentlyContinue)) {
-        Write-MigrationLog -Level 'WARN' -Category 'FINALIZE' `
-            -Message "sqmSQLTool not available - falling back to simple cleanup (orphans + owner)"
-        Invoke-PostRestoreCleanup -TargetServer $TargetServer -Databases $Databases -WhatIf:$WhatIf
-        Write-MigrationLog -Level 'WARN' -Category 'FINALIZE' `
-            -Message "Always On join skipped (Add-sqmDatabaseToAG not available) - please check manually"
-        return
-    }
-
-    # 1. Standardisierung
-    Write-MigrationLog -Level 'STEP' -Category 'STANDARD' -Message "Database standardization: $($Databases -join ', ')"
-    try {
-        $rows = @(Invoke-sqmDatabaseStandardization -SqlInstance $instance @credParam -Database $Databases `
-                    -WhatIf:$WhatIf -Confirm:$false -EnableException)
-        foreach ($r in $rows) {
-            $lvl = if ($r.Status -eq 'Failed') { 'WARN' } else { 'INFO' }
-            Write-MigrationLog -Level $lvl -Category 'STANDARD' `
-                -Message ("{0}: {1} {2} [{3}]" -f $r.Database, $r.Step, $r.Target, $r.Status) -Detail $r.Message
+    # Einzelaktionen; keine pauschale sqmSQLTool-Standardisierung.
+    # Die Datenbank-Owner werden bewusst niemals veraendert.
+    foreach ($db in $Databases) {
+        if ($RepairOrphanUsers) {
+            Invoke-PostRestoreCleanup -TargetServer $TargetServer -Databases @($db) -RepairOrphanUsers -WhatIf:$WhatIf
         }
-        $failed = @($rows | Where-Object Status -eq 'Failed').Count
-        $lvl = if ($failed) { 'WARN' } else { 'SUCCESS' }
-        Write-MigrationLog -Level $lvl -Category 'STANDARD' `
-            -Message "Standardization finished ($($rows.Count) actions, $failed failed)"
+        if ($SetCompatibilityLevel) {
+            try {
+                $ver = Invoke-DbaQuery -SqlInstance $TargetServer -Query "SELECT CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), 4) AS int) AS MajorVersion" -ErrorAction Stop
+                $major = [int]$ver.MajorVersion
+                $levels = @{ 17=170; 16=160; 15=150; 14=140; 13=130; 12=120; 11=110; 10=100 }
+                if ($levels.ContainsKey($major)) {
+                    $level = $levels[$major]
+                    $safeDb = $db.Replace(']', ']]')
+                    if ($WhatIf) { Write-MigrationLog -Level 'INFO' -Category 'COMPAT' -Message "[WHATIF] Set compatibility level ${level}: $db" }
+                    else {
+                        Invoke-DbaQuery -SqlInstance $TargetServer -Query "ALTER DATABASE [$safeDb] SET COMPATIBILITY_LEVEL = $level" -ErrorAction Stop | Out-Null
+                        Write-MigrationLog -Level 'SUCCESS' -Category 'COMPAT' -Message "Compatibility level set to ${level}: $db"
+                    }
+                } else { Write-MigrationLog -Level 'WARN' -Category 'COMPAT' -Message "Unknown SQL Server major version $major; compatibility unchanged for $db" }
+            } catch { Write-MigrationLog -Level 'WARN' -Category 'COMPAT' -Message "Could not set compatibility level: $db" -Detail $_.Exception.Message }
+        }
+        if ($SetTargetRecoveryTime) {
+            try {
+                $safeDb = $db.Replace(']', ']]')
+                if ($WhatIf) { Write-MigrationLog -Level 'INFO' -Category 'RECOVERY' -Message "[WHATIF] Set TARGET_RECOVERY_TIME = 60 seconds: $db" }
+                else {
+                    Invoke-DbaQuery -SqlInstance $TargetServer -Query "ALTER DATABASE [$safeDb] SET TARGET_RECOVERY_TIME = 60 SECONDS" -ErrorAction Stop | Out-Null
+                    Write-MigrationLog -Level 'SUCCESS' -Category 'RECOVERY' -Message "TARGET_RECOVERY_TIME set to 60 seconds: $db"
+                }
+            } catch { Write-MigrationLog -Level 'WARN' -Category 'RECOVERY' -Message "Could not set TARGET_RECOVERY_TIME: $db" -Detail $_.Exception.Message }
+        }
     }
-    catch {
-        Write-MigrationLog -Level 'WARN' -Category 'STANDARD' -Message "Standardization failed" -Detail $_.Exception.Message
+    if (-not ($RepairOrphanUsers -or $SetCompatibilityLevel -or $SetTargetRecoveryTime)) {
+        Write-MigrationLog -Level 'INFO' -Category 'STANDARD' -Message 'No database standardization actions selected; database owner and settings remain unchanged.'
     }
 
     # 2. Always On: ist das Ziel Primary einer AG?
@@ -1451,6 +1402,10 @@ function Invoke-DirectMigration {
         [bool]$SqlLoginsPresent   = $false,
         [switch]$WithCompression,
         [switch]$CopyOnly,
+        [switch]$StandardizeDatabases,
+        [switch]$SetCompatibilityLevel,
+        [switch]$RepairOrphanUsers,
+        [switch]$SetTargetRecoveryTime,
         [switch]$WhatIf
     )
     Write-MigrationLog -Level 'INFO' -Category 'DIRECT' -Message "Direct migration started (single run)"
@@ -1487,7 +1442,9 @@ function Invoke-DirectMigration {
 
     # 4. Abschluss: Standardisierung + ggf. Always-On-Aufnahme (nach Logins/Objekten)
     if ($Objects['Datenbanken'] -and $Databases.Count -gt 0) {
-        Invoke-MigrationFinalize -TargetServer $TargetServer -Databases $Databases -WhatIf:$WhatIf
+        Invoke-MigrationFinalize -TargetServer $TargetServer -Databases $Databases `
+            -SetCompatibilityLevel:$SetCompatibilityLevel -RepairOrphanUsers:$RepairOrphanUsers `
+            -SetTargetRecoveryTime:$SetTargetRecoveryTime -WhatIf:$WhatIf
     }
 
     Write-MigrationLog -Level 'SUCCESS' -Category 'DIRECT' -Message "Direct migration completed"
