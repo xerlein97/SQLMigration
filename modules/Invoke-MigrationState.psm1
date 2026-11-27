@@ -100,7 +100,7 @@ function Write-MigrationState {
         [Parameter(Mandatory)][string]$ExchangePath,
         [Parameter(Mandatory)][string]$StateFileName,
         [Parameter(Mandatory)][string]$SourceServer,
-        [Parameter(Mandatory)][string]$TargetServer,
+        [AllowNull()][AllowEmptyString()][string]$TargetServer = $null,
         [Parameter(Mandatory)][string]$Method,          # BackupRestore | DetachAttach
         [Parameter(Mandatory)][string[]]$Databases,
         [hashtable]$MigrationObjects,                   # welche Objekte migrieren
@@ -116,7 +116,8 @@ function Write-MigrationState {
         # Pfad zum exportierten Login-Skript (Phase 2 importiert daraus)
         [string]$LoginScriptFile    = '',
         # Pfade der Objekt-Skripte (Umweg): @{ Jobs=..; LinkedServers=..; Credentials=..; Proxies=.. }
-        [hashtable]$ObjectScripts   = @{}
+        [hashtable]$ObjectScripts   = @{},
+        [hashtable]$StandardizationOptions = @{}
     )
 
     $state = [ordered]@{
@@ -136,6 +137,7 @@ function Write-MigrationState {
         SqlLoginsPresent = $SqlLoginsPresent
         LoginScriptFile  = $LoginScriptFile
         ObjectScripts    = $ObjectScripts
+        StandardizationOptions = $StandardizationOptions
         Phase1CompletedAt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         Phase2CompletedAt = ''
     }
